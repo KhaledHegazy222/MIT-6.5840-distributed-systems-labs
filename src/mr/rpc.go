@@ -6,24 +6,50 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+	"sync"
+)
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
+type Task struct {
+	Idx      int
+	TaskType TaskType
+	Input    []string
+	Output   []string
+	Status   TaskStatus
+	mu       *sync.Mutex
 }
 
-type ExampleReply struct {
-	Y int
-}
+type TaskType int
+
+const (
+	TypeMap TaskType = iota
+	TypeReduce
+	TypeWait
+	TypeExit
+)
+
+type TaskStatus int
+
+const (
+	StatusPending TaskStatus = iota
+	StatusInProgress
+	StatusFinished
+)
 
 // Add your RPC definitions here.
+type FetchTaskArgs struct{}
 
+type FetchTaskReply struct {
+	Task Task
+}
+
+type MarkFinishedArgs struct {
+	Idx int
+}
+
+type MarkFinishedReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
