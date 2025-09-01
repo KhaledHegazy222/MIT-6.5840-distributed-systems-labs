@@ -1,12 +1,17 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"os"
+)
 
 // Debugging
 const Debug = false
 
+var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
+
 func DPrintf(format string, a ...interface{}) {
 	if Debug {
-		log.Printf(format, a...)
+		logger.Printf(format, a...)
 	}
 }
