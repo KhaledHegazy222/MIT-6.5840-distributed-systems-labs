@@ -10,6 +10,7 @@ import (
 	//	"bytes"
 
 	"context"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -30,17 +31,16 @@ const (
 )
 
 const (
-	HEARTBEAT_INTERVAL_MS  = 20
+	HEARTBEAT_INTERVAL_MS = 10
+
+	HEATBEAT_TIMEOUT_MIN_INTERVAL_MS = 200
+	HEATBEAT_TIMEOUT_MAX_INTERVAL_MS = 700
+
+	ELECTION_TIMEOUT_INTERVAL_MS = 50
+
+	REQUEST_VOTE_TIMEOUT   = 50
 	APPEND_ENTRIES_TIMEOUT = 50
-
-	HEATBEAT_TIMEOUT_MIN_INTERVAL_MS = 100
-	HEATBEAT_TIMEOUT_MAX_INTERVAL_MS = 200
-
-	ELECTION_TIMEOUT_MIN_INTERVAL_MS = 50
-	ELECTION_TIMEOUT_MAX_INTERVAL_MS = 500
-
-	REQUEST_VOTE_TIMEOUT = 200
-	RPC_RETRY_INTERVAL   = 10
+	RPC_RETRY_INTERVAL     = 10
 )
 
 // A Go object implementing a single Raft peer.
@@ -74,7 +74,7 @@ type Raft struct {
 }
 
 type Log struct {
-	Command string
+	Command interface{}
 	Term    int
 }
 
@@ -168,30 +168,41 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
+		DPrintf("[%d] REJECTING VOTES MY term is %d, his (%d) is %d ", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+
 		reply.Term = rf.currentTerm
 		return
+	} else if args.Term > rf.currentTerm {
+		reply.VoteGranted = false
+		rf.votedFor = -1
+		rf.currentTerm = args.Term
+		rf.currentRole = RoleFollower
 	}
 
 	// reject voting if voted for another this term
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		DPrintf("[%d] Already Voted to %d, rejecting: %d", rf.me, rf.votedFor, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
 	myLastLogTerm := 0
 	myLastLogIndex := 0
 	if len(rf.logs) > 0 {
-		myLastLogIndex = len(rf.logs)
-		myLastLogTerm = rf.logs[myLastLogIndex-1].Term
+		myLastLogIndex = len(rf.logs) - 1
+		myLastLogTerm = rf.logs[myLastLogIndex].Term
 	}
 
 	// grant vote
 	if args.LastLogTerm > myLastLogTerm || (args.LastLogTerm == myLastLogTerm && args.LastLogIndex >= myLastLogIndex) {
 
+		DPrintf("[%d] ACCEPTING VOTES MY LASTs (%d,%d), HIS (%d) LASTS (%d,%d)", rf.me, myLastLogIndex, myLastLogTerm, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		reply.Term = args.Term
 		return
 	}
+
+	DPrintf("[%d] REJECTING VOTES MY LASTs (%d,%d), HIS (%d) LASTS (%d,%d)", rf.me, myLastLogIndex, myLastLogTerm, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm // TODO: this might change later
@@ -235,8 +246,8 @@ func (rf *Raft) sendRequestVoteToServer(ctx context.Context, idx int, ch chan Re
 
 	rf.mu.RLock()
 	if len(rf.logs) > 0 {
-		lastLogIndex = len(rf.logs)
-		lastLogTerm = rf.logs[lastLogIndex-1].Term
+		lastLogIndex = len(rf.logs) - 1
+		lastLogTerm = rf.logs[lastLogIndex].Term
 	}
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -259,6 +270,7 @@ func (rf *Raft) sendRequestVoteToServer(ctx context.Context, idx int, ch chan Re
 				continue
 			}
 			ch <- reply
+			return
 		}
 	}
 }
@@ -276,6 +288,7 @@ func (rf *Raft) startElections() {
 	rf.mu.Lock()
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	DPrintf("[%d] NEW ELECTIONS, Term :%d", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 	replyCh := make(chan RequestVoteReply)
 
@@ -297,10 +310,18 @@ func (rf *Raft) startElections() {
 					grantedVotes++
 				}
 				if grantedVotes == neededMajority {
-					DPrintf("MEMBER: %d is now LEADER (%d)", rf.me, grantedVotes)
+					DPrintf("[%d] I am LEADER with (%d votes)", rf.me, grantedVotes)
 					rf.mu.Lock()
 					rf.currentRole = RoleLeader
 					rf.leaderId = rf.me
+
+					rf.nextIdx = make([]int, len(rf.peers))
+					rf.matchIdx = make([]int, len(rf.peers))
+					for idx := range rf.peers {
+						rf.nextIdx[idx] = len(rf.logs)
+						rf.matchIdx[idx] = 0
+					}
+
 					rf.mu.Unlock()
 					cancel()
 				}
@@ -310,8 +331,15 @@ func (rf *Raft) startElections() {
 
 	<-ctx.Done()
 	rf.mu.Lock()
+	if rf.currentRole == RoleLeader {
+		DPrintf("[%d] FINISHED ELECTIONS Became Leader", rf.me)
+	} else {
+		rf.currentRole = RoleFollower
+		DPrintf("[%d] FINISHED ELECTIONS Failed", rf.me)
+	}
 	rf.votedFor = -1
 	rf.mu.Unlock()
+	rf.resetTimoutCh <- struct{}{}
 }
 
 // example AppendEntries RPC arguments structure.
@@ -346,7 +374,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// convert to follower and accepts the heartBeat
 		rf.mu.Lock()
-
 		rf.currentRole = RoleFollower
 		rf.currentTerm = args.Term
 		rf.leaderId = args.LeaderId
@@ -356,16 +383,56 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// send reset the timeout signal
 		rf.resetTimoutCh <- struct{}{}
 
-		// Prepare Reply
-		reply.Success = true
-		reply.Term = args.Term
+		rf.syncWithLeader(args, reply)
 		return
 
 	} else {
 		// Rejects the append entries
 		reply.Term = currentTerm
 		reply.Success = false
+		DPrintf("[%d] I reject new logs (stale leader)", rf.me)
 		return
+	}
+}
+
+func (rf *Raft) syncWithLeader(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.PrevLogIndex >= len(rf.logs) {
+		DPrintf("[%d] ACCESSING %d of %d", rf.me, args.PrevLogIndex, len(rf.logs))
+		// don't match return error
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// don't match return error
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		DPrintf("[%d] I reject new logs (conflict) prev idx: [%d] prev term: [%d] current term: %d", rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.logs[args.PrevLogIndex].Term)
+	} else {
+		// accept the logs
+		// clear up all the next logs
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
+		rf.logs = append(rf.logs, args.Entries...)
+
+		if rf.commitIdx < args.LeaderCommit {
+			newCommitIdx := int(math.Min(float64(len(rf.logs)-1), float64(args.LeaderCommit)))
+			for rf.commitIdx < newCommitIdx {
+				rf.commitIdx++
+				DPrintf("[%d] FOLLOWER COMMITTING: %d, of total: %d", rf.me, rf.commitIdx, len(rf.logs))
+				rf.applyCh <- raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[rf.commitIdx].Command,
+					CommandIndex: rf.commitIdx,
+				}
+			}
+		}
+
+		reply.Success = true
+		reply.Term = args.Term
 	}
 }
 
@@ -401,27 +468,66 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) sendHeartBeatToServer(ctx context.Context, idx int, reachabilityCh chan AppendEntriesReply) {
-	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-		// PrevLogIndex: rf.nextIdx[idx],                 // TODO: CHANGE this if tests failed
-		// PrevLogTerm:  rf.logs[rf.nextIdx[idx]-1].term, // TODO: CHANGE this if tests failed
-		Entries: []Log{},
-		// LeaderCommit: rf.commitIdx, // TODO: CHANGE this if tests failed
-	}
-	reply := AppendEntriesReply{}
+func (rf *Raft) sendHeartBeatToServer(ctx context.Context, idx int, nextBatchIdx int, replyCh chan AppendEntriesReply, cancel context.CancelFunc) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			rf.mu.RLock()
+			prevIdx := rf.nextIdx[idx] - 1 // TODO: CHANGE this if tests failed
+			if prevIdx < 0 {
+				DPrintf("[%d] ACCESSING NEGATIVE INDEX %v", rf.me, rf.nextIdx)
+			}
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevIdx,
+				PrevLogTerm:  rf.logs[prevIdx].Term,
+				Entries:      rf.logs[prevIdx+1 : nextBatchIdx+1],
+				LeaderCommit: rf.commitIdx,
+			}
+			rf.mu.RUnlock()
+
+			reply := AppendEntriesReply{}
+
 			ok := rf.sendAppendEntries(idx, &args, &reply)
 			if !ok {
 				time.Sleep(RPC_RETRY_INTERVAL * time.Millisecond)
 				continue
 			}
-			reachabilityCh <- reply
+			rf.mu.Lock()
+			if reply.Success {
+				rf.nextIdx[idx] = prevIdx + len(args.Entries) + 1
+				rf.mu.Unlock()
+				replyCh <- reply
+				return
+			}
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.currentRole = RoleFollower
+				rf.leaderId = -1
+				cancel()
+				DPrintf("[%d] Done Depromoting to follower", rf.me)
+			} else {
+				if rf.nextIdx[idx] == len(rf.logs) {
+					rf.nextIdx[idx]--
+					DPrintf("[%d] Dropping idx: %d", rf.me, rf.nextIdx[idx])
+
+				}
+				droppedTerm := rf.logs[rf.nextIdx[idx]].Term
+				DPrintf("[%d] Dropping Term %d", rf.me, droppedTerm)
+				for rf.nextIdx[idx] > 1 {
+					if rf.logs[rf.nextIdx[idx]].Term == droppedTerm {
+						DPrintf("[%d] Dropping idx: %d", rf.me, rf.nextIdx[idx])
+						rf.nextIdx[idx]--
+					} else {
+						break
+					}
+				}
+				DPrintf("[%d] FAILED TO PUSH TO: %d, retrying with %d", rf.me, idx, rf.nextIdx[idx])
+			}
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -429,15 +535,21 @@ func (rf *Raft) sendHeartBeatToServer(ctx context.Context, idx int, reachability
 func (rf *Raft) sendHeartBeat() {
 	ctx, cancel := context.WithTimeout(context.Background(), APPEND_ENTRIES_TIMEOUT*time.Millisecond)
 	defer cancel()
+	rf.mu.RLock()
+	nextBatchIdx := len(rf.logs) - 1
+	nextBatch := []Log{}
+	if rf.commitIdx < nextBatchIdx {
+		nextBatch = rf.logs[rf.commitIdx+1:]
+	}
+	rf.mu.RUnlock()
 	replyCh := make(chan AppendEntriesReply)
-	mu := sync.RWMutex{}
 	reachable := 1
 	majority := (len(rf.peers) + 1) / 2
 	for idx := range rf.peers {
 		if idx == rf.me {
 			continue
 		}
-		go rf.sendHeartBeatToServer(ctx, idx, replyCh)
+		go rf.sendHeartBeatToServer(ctx, idx, nextBatchIdx, replyCh, cancel)
 	}
 	go func() {
 		for {
@@ -446,23 +558,36 @@ func (rf *Raft) sendHeartBeat() {
 				return
 			case reply := <-replyCh:
 				if reply.Success {
-					mu.Lock()
+					rf.mu.Lock()
 					reachable++
-					mu.Unlock()
+					// DPrintf("[%d] COMMITTING MSG: %d", rf.me, nextCommitIdx)
+					if reachable == majority {
+						for _, b := range nextBatch {
+							rf.commitIdx++
+							DPrintf("[%d] Committing %d", rf.me, rf.commitIdx)
+							rf.applyCh <- raftapi.ApplyMsg{
+								CommandValid: true,
+								CommandIndex: rf.commitIdx,
+								Command:      b.Command,
+							}
+						}
+						rf.mu.Unlock()
+						return
+
+					}
+					rf.mu.Unlock()
 				}
 			}
 		}
 	}()
 	<-ctx.Done()
-	mu.RLock()
-	defer mu.RUnlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if reachable < majority {
 		// deporomote yourself
-		rf.mu.Lock()
 		rf.currentRole = RoleFollower
 		rf.leaderId = -1
-		rf.mu.Unlock()
-		DPrintf("I: %d, Done Depromoting to follower", rf.me)
+		DPrintf("[%d] Done Depromoting to follower", rf.me)
 	}
 }
 
@@ -492,12 +617,26 @@ func (rf *Raft) heartBeat() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
+	// Your code here (3B).
+	_, isleader := rf.GetState()
+
+	if !isleader {
+		return 0, 0, false
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.logs = append(rf.logs, Log{
+		Command: command,
+		Term:    rf.currentTerm,
+	})
+
+	index := len(rf.logs) - 1
+	term := rf.currentTerm
 	isLeader := true
 
-	// Your code here (3B).
-
+	DPrintf("[%d] NEW LOGS: %d", rf.me, len(rf.logs))
 	return index, term, isLeader
 }
 
@@ -531,11 +670,12 @@ func (rf *Raft) ticker() {
 
 		if isCandidate {
 			rf.startElections()
+			DPrintf("[%d] FINISHED ELECTIONS", rf.me)
 		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := ELECTION_TIMEOUT_MIN_INTERVAL_MS + (rand.Int63() % (ELECTION_TIMEOUT_MAX_INTERVAL_MS - ELECTION_TIMEOUT_MIN_INTERVAL_MS))
+		ms := ELECTION_TIMEOUT_INTERVAL_MS
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -577,19 +717,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		resetTimoutCh: make(chan struct{}),
 		currentTerm:   0, // TODO: Change it to read from persister storage instead
 		votedFor:      -1,
-		logs:          []Log{}, // logs start by 1 as index
-		commitIdx:     0,
-		lastApplied:   0,
-		currentRole:   RoleFollower,
+		leaderId:      -1,
+		logs: []Log{
+			{
+				Command: "",
+				Term:    0,
+			},
+		}, // logs start by 1 as index
+		commitIdx:   0,
+		lastApplied: 0,
+		currentRole: RoleFollower,
 	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
-	go rf.heartBeat()
-	go rf.checkTimeout()
+	go rf.ticker()       // for elections
+	go rf.heartBeat()    // for leaders
+	go rf.checkTimeout() // for followers
 
 	return rf
 }
